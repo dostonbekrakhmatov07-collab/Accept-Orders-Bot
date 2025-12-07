@@ -11,9 +11,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ------------------ Настройки ------------------
 TOKEN = "8537204507:AAG7DJpZPgCVVrlNkVCPXk_1U9uVobgn7h8"
-# Укажи реальные Telegram ID модераторов (по одному на категорию)
 MODERATORS: Dict[str, int] = {
-    "Backend": 8077275072,           # <- замените на реальный id
+    "Backend": 8077275072,           
     "Frontend": 8077275072,
     "Grafik dizayner": 8077275072,
     "Kiberxavfsizlik": 8077275072
@@ -26,10 +25,10 @@ PAGE_SIZE = 5
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# временные состояния в памяти
+# временные состояния
 temp_state = {
-    "awaiting_order_from": {},    # user_id -> category (когда ждем описание после выбора категории)
-    "awaiting_send_from_mod": {}, # mod_id -> order_id (когда ждем от модератора результат для отправки)
+    "awaiting_order_from": {},    # user_id -> category
+    "awaiting_send_from_mod": {}, # mod_id -> order_id
 }
 
 # ------------------ SQLite helpers ------------------
@@ -48,8 +47,8 @@ def init_db():
         username TEXT,
         category TEXT,
         description TEXT,
-        status TEXT,          -- pending, in_progress, done, rejected
-        assigned_mod INTEGER, -- id модератора
+        status TEXT,
+        assigned_mod INTEGER,
         result_text TEXT,
         created_at TEXT,
         updated_at TEXT
@@ -114,14 +113,6 @@ def get_user_orders(user_id: int):
     conn.close()
     return rows
 
-def get_orders_by_status(status: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM orders WHERE status = ? ORDER BY created_at DESC", (status,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
 # init db
 init_db()
 
@@ -135,128 +126,136 @@ def categories_kb():
 
 def start_kb(user: types.User):
     kb = InlineKeyboardBuilder()
-    kb.button(text="📦 Buyurtma berish", callback_data="make_order")
-    kb.button(text="📄 Mening zakazlarim", callback_data="my_orders")
-    # если пользователь является модератор — показать кнопку "My tasks"
+    kb.button(text="📦 Сделать заказ", callback_data="make_order")
+    kb.button(text="📄 Мои заказы", callback_data="my_orders")
     if user.id in MODERATORS.values():
-        kb.button(text="🛠️ My tasks", callback_data="my_tasks")
+        kb.button(text="🛠️ Мои задачи", callback_data="my_tasks")
     kb.adjust(2)
     return kb.as_markup()
 
 def mod_notification_kb(order_id: str):
     kb = InlineKeyboardBuilder()
-    kb.button(text="👀 Ko'rish", callback_data=f"mod_view_{order_id}")
-    kb.button(text="🛠️ Olish (в работу)", callback_data=f"mod_start_{order_id}")
+    kb.button(text="👀 Просмотреть", callback_data=f"mod_view_{order_id}")
+    kb.button(text="🛠️ В работу", callback_data=f"mod_start_{order_id}")
     kb.button(text="📤 Отправить результат", callback_data=f"mod_send_{order_id}")
-    kb.button(text="❌ Rad etish", callback_data=f"mod_reject_{order_id}")
-    kb.button(text="🗑️ O'chirish", callback_data=f"mod_delete_{order_id}")
+    kb.button(text="❌ Отклонить", callback_data=f"mod_reject_{order_id}")
+    kb.button(text="🗑️ Удалить", callback_data=f"mod_delete_{order_id}")
     kb.adjust(2)
     return kb.as_markup()
 
 def order_options_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="Baholash ⭐️", callback_data="rate")
-    kb.button(text="Admin bilan bog'lanish 📩", callback_data="contact_admin")
-    kb.button(text="Zakazni bekor qilish ❌", callback_data="cancel_order")
+    kb.button(text="Оценить ⭐️", callback_data="rate")
+    kb.button(text="Связь с админом 📩", callback_data="contact_admin")
+    kb.button(text="Отменить заказ ❌", callback_data="cancel_order")
     kb.adjust(2)
     return kb.as_markup()
 
 # ------------------ Пользовательский флоу ------------------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("Salom! Nima qilmoqchisiz?", reply_markup=start_kb(message.from_user))
+    await message.answer("Привет! Что хотите сделать?", reply_markup=start_kb(message.from_user))
 
 @dp.callback_query(lambda c: c.data == "make_order")
 async def cb_make_order(callback: types.CallbackQuery):
-    await callback.message.answer("Qaysi sohada buyurtma berasiz? Tanlang:", reply_markup=categories_kb())
+    await callback.message.answer("В какой сфере хотите сделать заказ? Выберите:", reply_markup=categories_kb())
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("cat_"))
 async def cb_category_selected(callback: types.CallbackQuery):
     category = callback.data.split("_", 1)[1]
-    # Сохраняем в temp_state, ждем описание от пользователя
     temp_state["awaiting_order_from"][callback.from_user.id] = category
-    await callback.message.answer(f"Tanlangan: {category}\nIltimos, buyurtma tavsifini yuboring (tekst).")
+    await callback.message.answer(f"Выбрано: {category}\nПожалуйста, отправьте описание заказа (текст).")
     await callback.answer()
 
 @dp.message()
 async def catch_message_general(message: types.Message):
     uid = message.from_user.id
 
-    # 1) если ждем описание заказа от пользователя
     if uid in temp_state["awaiting_order_from"]:
         category = temp_state["awaiting_order_from"].pop(uid)
         desc = message.text or ""
         order_id = create_order_row(message.from_user, desc, category)
-        # отправляем уведомление ответственному модеру
         mod_id = MODERATORS.get(category)
         if mod_id:
             try:
                 await bot.send_message(
                     mod_id,
-                    f"📩 Yangi buyurtma ({category}):\nID: <code>{order_id}</code>\nFrom: @{message.from_user.username or message.from_user.id} ({message.from_user.id})\n\n{desc}",
+                    f"📩 Новый заказ ({category}):\nID: <code>{order_id}</code>\nОт: @{message.from_user.username or message.from_user.id} ({message.from_user.id})\n\n{desc}",
                     reply_markup=mod_notification_kb(order_id),
                     parse_mode="HTML"
                 )
             except Exception:
                 pass
-        await message.answer("Buyurtmangiz moderatorga yuborildi. Tez orada tekshiriladi.", reply_markup=order_options_kb())
+        await message.answer("Ваш заказ отправлен модератору. Скоро будет проверен.", reply_markup=order_options_kb())
         return
 
-    # 2) если модератор должен прислать результат (ждем файл/фото/док/текст)
     if uid in temp_state["awaiting_send_from_mod"]:
         order_id = temp_state["awaiting_send_from_mod"].pop(uid)
         order = get_order(order_id)
         if not order:
-            await message.answer("Order topilmadi yoki allaqachon ishlangan.")
+            await message.answer("Заказ не найден или уже обработан.")
             return
         user_id = order["user_id"]
-        # Попробуем переслать (копировать) любое сообщение модератора заказчику
         try:
             await bot.copy_message(chat_id=user_id, from_chat_id=uid, message_id=message.message_id)
         except Exception:
-            # если не получилось копировать, отправим текст
             if message.text:
-                await bot.send_message(user_id, f"📤 Moderator прислал результат:\n\n{message.text}")
+                await bot.send_message(user_id, f"📤 Модератор прислал результат:\n\n{message.text}")
             else:
-                await message.answer("Не удалось переслать сообщение. Попробуйте отправить как документ/фото или текст ещё раз.")
+                await message.answer("Не удалось переслать сообщение. Попробуйте другой формат.")
                 return
-        # обновим статус заказа
         res_text = message.text if message.text else "[media]"
         update_order_status(order_id, "done", assigned_mod=uid, result_text=res_text)
-        await message.answer("Natija yuborildi va zakaz belgilandi: DONE ✅")
+        await message.answer("Результат отправлен ✅")
         return
 
-    # иначе — проверка команды просмотра своих заказов у пользователя/модератора (если кликали кнопку)
-    # просто игнорируем свободные сообщения
-    return
+# ------------------ Обработчики пользовательских кнопок ------------------
+@dp.callback_query(lambda c: c.data == "rate")
+async def cb_rate(callback: types.CallbackQuery):
+    await callback.message.answer("Спасибо за вашу оценку!")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "contact_admin")
+async def cb_contact_admin(callback: types.CallbackQuery):
+    await callback.message.answer("Вы можете написать администратору: @admin_username")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "cancel_order")
+async def cb_cancel_order(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    rows = get_user_orders(user_id)
+    if not rows:
+        await callback.answer("У вас нет заказов для отмены.", show_alert=True)
+        return
+    last_order_id = rows[0]['order_id']
+    update_order_status(last_order_id, "rejected")
+    await callback.message.answer(f"Ваш заказ {last_order_id} отменён ❌")
+    await callback.answer()
 
 # ------------------ Модераторские callback'ы ------------------
 @dp.callback_query(lambda c: c.data.startswith("mod_view_"))
 async def mod_view(callback: types.CallbackQuery):
     mod_id = callback.from_user.id
     order_id = callback.data.split("_", 2)[2]
-    # проверка прав: модератор должен соответствовать категории заказа
     row = get_order(order_id)
     if not row:
-        await callback.answer("Order topilmadi.", show_alert=True)
+        await callback.answer("Заказ не найден.", show_alert=True)
         return
-    cat = row["category"]
-    expected_mod = MODERATORS.get(cat)
-    if mod_id != expected_mod:
-        await callback.answer("Bu buyurtma sizga tegishli emas.", show_alert=True)
+    if mod_id != MODERATORS.get(row["category"]):
+        await callback.answer("Этот заказ вам не принадлежит.", show_alert=True)
         return
     text = (
-        f"📝 Order\nID: <code>{row['order_id']}</code>\nUser: @{row['username']} ({row['user_id']})\n"
-        f"Kategoriya: {row['category']}\nDescription: {row['description']}\nStatus: {row['status']}\nCreated: {row['created_at']}"
+        f"📝 Заказ\nID: <code>{row['order_id']}</code>\nUser: @{row['username']} ({row['user_id']})\n"
+        f"Категория: {row['category']}\nОписание: {row['description']}\nСтатус: {row['status']}\nСоздано: {row['created_at']}"
     )
     kb = InlineKeyboardBuilder()
     if row["status"] == "pending":
-        kb.button(text="🛠️ Olish (в работу)", callback_data=f"mod_start_{order_id}")
+        kb.button(text="🛠️ В работу", callback_data=f"mod_start_{order_id}")
     if row["status"] in ("pending", "in_progress"):
         kb.button(text="📤 Отправить результат", callback_data=f"mod_send_{order_id}")
-        kb.button(text="❌ Rad etish", callback_data=f"mod_reject_{order_id}")
-    kb.button(text="🗑️ O'chirish", callback_data=f"mod_delete_{order_id}")
+        kb.button(text="❌ Отклонить", callback_data=f"mod_reject_{order_id}")
+    kb.button(text="🗑️ Удалить", callback_data=f"mod_delete_{order_id}")
     kb.adjust(2)
     await callback.message.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
     await callback.answer()
@@ -266,31 +265,23 @@ async def mod_start(callback: types.CallbackQuery):
     mod_id = callback.from_user.id
     order_id = callback.data.split("_", 2)[2]
     row = get_order(order_id)
-    if not row:
-        await callback.answer("Order topilmadi.", show_alert=True)
-        return
-    # проверка прав
-    if MODERATORS.get(row["category"]) != mod_id:
-        await callback.answer("Bu buyurtma sizga tegishli emas.", show_alert=True)
+    if not row or MODERATORS.get(row["category"]) != mod_id:
+        await callback.answer("Этот заказ вам не принадлежит.", show_alert=True)
         return
     update_order_status(order_id, "in_progress", assigned_mod=mod_id)
-    await callback.message.answer(f"Zakaz {order_id} olindi в работу ✅. Endi 'Отправить результат' tugmasini bosing va fayl/tekst yuboring.")
-    await callback.answer("Olingan в работу.")
+    await callback.message.answer(f"Заказ {order_id} взят в работу ✅. Отправьте результат кнопкой 'Отправить результат'.")
+    await callback.answer("В работу.")
 
 @dp.callback_query(lambda c: c.data.startswith("mod_send_"))
 async def mod_send(callback: types.CallbackQuery):
     mod_id = callback.from_user.id
     order_id = callback.data.split("_", 2)[2]
     row = get_order(order_id)
-    if not row:
-        await callback.answer("Order topilmadi.", show_alert=True)
+    if not row or MODERATORS.get(row["category"]) != mod_id:
+        await callback.answer("Этот заказ вам не принадлежит.", show_alert=True)
         return
-    if MODERATORS.get(row["category"]) != mod_id:
-        await callback.answer("Bu buyurtma sizga tegishli emas.", show_alert=True)
-        return
-    # ставим ожидание: следующий message от модератора будет переслан заказчику
     temp_state["awaiting_send_from_mod"][mod_id] = order_id
-    await callback.message.answer("Iltimos, natijani (fayl/rasm/dokument/video yoki tekst) yuboring — u avtomatik tarzda mijozga yuboriladi.")
+    await callback.message.answer("Отправьте результат (файл/текст), он автоматически будет отправлен клиенту.")
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("mod_reject_"))
@@ -298,19 +289,15 @@ async def mod_reject(callback: types.CallbackQuery):
     mod_id = callback.from_user.id
     order_id = callback.data.split("_", 2)[2]
     row = get_order(order_id)
-    if not row:
-        await callback.answer("Order topilmadi.", show_alert=True)
-        return
-    if MODERATORS.get(row["category"]) != mod_id:
-        await callback.answer("Bu buyurtma sizga tegishli emas.", show_alert=True)
+    if not row or MODERATORS.get(row["category"]) != mod_id:
+        await callback.answer("Этот заказ вам не принадлежит.", show_alert=True)
         return
     update_order_status(order_id, "rejected", assigned_mod=mod_id, result_text="rejected_by_mod")
-    # уведомляем заказчика
     try:
-        await bot.send_message(row["user_id"], f"❌ Sizning buyurtmangiz (ID: {order_id}) moderator tomonidan rad etildi.")
+        await bot.send_message(row["user_id"], f"❌ Ваш заказ (ID: {order_id}) отклонён модератором.")
     except Exception:
         pass
-    await callback.message.answer("Zakaz rad etildi va mijozga xabar yuborildi.")
+    await callback.message.answer("Заказ отклонён и клиенту отправлено уведомление.")
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("mod_delete_"))
@@ -318,15 +305,11 @@ async def mod_delete(callback: types.CallbackQuery):
     mod_id = callback.from_user.id
     order_id = callback.data.split("_", 2)[2]
     row = get_order(order_id)
-    if not row:
-        await callback.answer("Order topilmadi.", show_alert=True)
-        return
-    # Только модератор категории или админ (в нашем случае модераторы только свои) может удалить
-    if MODERATORS.get(row["category"]) != mod_id:
-        await callback.answer("Bu buyurtma sizga tegishli emas.", show_alert=True)
+    if not row or MODERATORS.get(row["category"]) != mod_id:
+        await callback.answer("Этот заказ вам не принадлежит.", show_alert=True)
         return
     delete_order(order_id)
-    await callback.message.answer("Zakaz o'chirildi.")
+    await callback.message.answer("Заказ удалён.")
     await callback.answer()
 
 # ------------------ Просмотр задач модератора ------------------
@@ -334,9 +317,8 @@ async def mod_delete(callback: types.CallbackQuery):
 async def cb_my_tasks(callback: types.CallbackQuery):
     mod_id = callback.from_user.id
     if mod_id not in MODERATORS.values():
-        await callback.answer("Siz moderatorsiz emas.", show_alert=True)
+        await callback.answer("Вы не модератор.", show_alert=True)
         return
-    # найдём категорию(и) за которую отвечает этот модератор (в нашем случае 1)
     cats = [k for k, v in MODERATORS.items() if v == mod_id]
     text = ""
     any_found = False
@@ -344,11 +326,11 @@ async def cb_my_tasks(callback: types.CallbackQuery):
         pending = get_pending_orders_by_category(cat)
         if pending:
             any_found = True
-            text += f"📂 {cat} — {len(pending)} pending:\n\n"
+            text += f"📂 {cat} — {len(pending)} заказов в ожидании:\n\n"
             for o in pending:
-                text += f"ID: <code>{o['order_id']}</code>\nUser: @{o['username']} ({o['user_id']})\n{ o['description'] }\n\n"
+                text += f"ID: <code>{o['order_id']}</code>\nUser: @{o['username']} ({o['user_id']})\n{o['description']}\n\n"
     if not any_found:
-        await callback.message.answer("Hozircha sizga tegishli pending yo'q.")
+        await callback.message.answer("Пока нет заказов в ожидании.")
     else:
         await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
@@ -359,12 +341,12 @@ async def cb_my_orders(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     rows = get_user_orders(user_id)
     if not rows:
-        await callback.message.answer("Sizda hech qanday zakaz yo'q.")
+        await callback.message.answer("У вас нет заказов.")
         await callback.answer()
         return
-    text = "Sizning zakazlaringiz:\n\n"
+    text = "Ваши заказы:\n\n"
     for r in rows:
-        text += f"ID: <code>{r['order_id']}</code>\nKategoriya: {r['category']}\nStatus: {r['status']}\nResult: {r['result_text'] or '—'}\n\n"
+        text += f"ID: <code>{r['order_id']}</code>\nКатегория: {r['category']}\nСтатус: {r['status']}\nРезультат: {r['result_text'] or '—'}\n\n"
     await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
 
