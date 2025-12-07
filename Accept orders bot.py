@@ -1,429 +1,376 @@
-"""
-Admin panel bot (aiogram 3.22)
-Функции:
-- /start - обычное меню пользователя
-- Отправка заказа пользователем -> уходит в pending и админам
-- /admin - открывает админ-панель (только для id из ADMINS)
-- Просмотр pending с пагинацией, просмотр approved, принятие/отклонение/удаление
-- Поиск по user_id
-- Статистика
-- /broadcast - следующий текст отправится всем users с approved заказами
-"""
-
+# bot_categories_moderators.py
 import asyncio
-import json
-import os
+import sqlite3
 import uuid
-from datetime import datetime, date
+from datetime import datetime
+from typing import Optional, Dict
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# ---------- Настройки ----------
+# ------------------ Настройки ------------------
 TOKEN = "8537204507:AAG7DJpZPgCVVrlNkVCPXk_1U9uVobgn7h8"
-ADMINS = [8077275072]  # <- вставь сюда id админов
-
-PENDING_FILE = "pending_orders.json"
-ORDERS_FILE = "orders.json"
-# --------------------------------
+# Укажи реальные Telegram ID модераторов (по одному на категорию)
+MODERATORS: Dict[str, int] = {
+    "Backend": 8077275072,           # <- замените на реальный id
+    "Frontend": 8077275072,
+    "Grafik dizayner": 8077275072,
+    "Kiberxavfsizlik": 8077275072
+}
+CATEGORIES = list(MODERATORS.keys())
+DB_PATH = "orders.db"
+PAGE_SIZE = 5
+# ------------------------------------------------
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Временное хранилище состояний (для простоты)
+# временные состояния в памяти
 temp_state = {
-    "awaiting_order_from": {},   # user_id -> True (когда ждем текст заказа)
-    "awaiting_search_from": {},  # admin_id -> True (когда ждем id для поиска)
-    "awaiting_broadcast_from": {},# admin_id -> True (когда ждем текст для рассылки)
+    "awaiting_order_from": {},    # user_id -> category (когда ждем описание после выбора категории)
+    "awaiting_send_from_mod": {}, # mod_id -> order_id (когда ждем от модератора результат для отправки)
 }
 
-# ---------- Утилиты работы с файлами ----------
-def load_json(path, default):
-    try:
-        if not os.path.exists(path):
-            return default
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
+# ------------------ SQLite helpers ------------------
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS orders (
+        order_id TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        username TEXT,
+        category TEXT,
+        description TEXT,
+        status TEXT,          -- pending, in_progress, done, rejected
+        assigned_mod INTEGER, -- id модератора
+        result_text TEXT,
+        created_at TEXT,
+        updated_at TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
 
-def ensure_files():
-    if not os.path.exists(PENDING_FILE):
-        save_json(PENDING_FILE, {"orders": []})
-    if not os.path.exists(ORDERS_FILE):
-        save_json(ORDERS_FILE, {"orders": []})
+def create_order_row(user: types.User, description: str, category: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    oid = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
+    cur.execute(
+        "INSERT INTO orders(order_id, user_id, username, category, description, status, assigned_mod, result_text, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)",
+        (oid, user.id, user.username or "", category, description, now, now)
+    )
+    conn.commit()
+    conn.close()
+    return oid
 
-ensure_files()
+def get_pending_orders_by_category(category: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM orders WHERE status = 'pending' AND category = ? ORDER BY created_at DESC", (category,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
-# ---------- Вспомогательные функции ----------
-def create_order_entry(user: types.User, category: str, budget: int, title: str, attachments=None):
-    return {
-        "order_id": str(uuid.uuid4()),
-        "user_id": user.id,
-        "username": user.username or "",
-        "first_name": user.first_name or "",
-        "category": category,
-        "budget": budget,
-        "order_title": title,
-        "attachments": attachments or [],
-        "random_price": None,
-        "created_at": datetime.utcnow().isoformat()
-    }
+def get_order(order_id: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
 
-def get_stats():
-    pending = load_json(PENDING_FILE, {"orders": []})["orders"]
-    orders = load_json(ORDERS_FILE, {"orders": []})["orders"]
-    total = len(pending) + len(orders)
-    approved = len([o for o in orders if o.get("status") == "approved"])
-    rejected = len([o for o in orders if o.get("status") == "rejected"])
-    pending_cnt = len(pending)
-    return {"total": total, "approved": approved, "rejected": rejected, "pending": pending_cnt}
+def update_order_status(order_id: str, status: str, assigned_mod: Optional[int] = None, result_text: Optional[str] = None):
+    conn = get_conn()
+    cur = conn.cursor()
+    now = datetime.utcnow().isoformat()
+    cur.execute(
+        "UPDATE orders SET status = ?, assigned_mod = ?, result_text = ?, updated_at = ? WHERE order_id = ?",
+        (status, assigned_mod, result_text, now, order_id)
+    )
+    conn.commit()
+    conn.close()
 
-# ---------- Меню /start ----------
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+def delete_order(order_id: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM orders WHERE order_id = ?", (order_id,))
+    conn.commit()
+    conn.close()
+
+def get_user_orders(user_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def get_orders_by_status(status: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM orders WHERE status = ? ORDER BY created_at DESC", (status,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+# init db
+init_db()
+
+# ------------------ Keyboards ------------------
+def categories_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="📦 Buyurtma berish", callback_data="make_order")
-    if message.from_user.id in ADMINS:
-        kb.button(text="🔐 Admin panel", callback_data="open_admin")
-    kb.adjust(1)
-    await message.answer("Assalomu alaykum! Tanlang:", reply_markup=kb.as_markup())
-
-# ---------- Пользователь: начать заказ ----------
-@dp.callback_query(lambda c: c.data == "make_order")
-async def on_make_order(callback: types.CallbackQuery):
-    await callback.message.answer("Yubormoqchi bo'lgan buyurtma matnini kiriting (sodda matn).")
-    temp_state["awaiting_order_from"][callback.from_user.id] = True
-    await callback.answer()
-
-# ---------- Прием текста заказа от пользователя ----------
-@dp.message()
-async def catch_user_order(message: types.Message):
-    user_id = message.from_user.id
-    # если ждем заказ от пользователя
-    if temp_state["awaiting_order_from"].get(user_id):
-        # Для простоты: не используем категории/бюджет — можно расширить
-        title = message.text.strip()
-        pending = load_json(PENDING_FILE, {"orders": []})
-        entry = {
-            "order_id": str(uuid.uuid4()),
-            "user_id": user_id,
-            "username": message.from_user.username or "",
-            "first_name": message.from_user.first_name or "",
-            "category": "—",
-            "budget": 0,
-            "order_title": title,
-            "attachments": [],
-            "created_at": datetime.utcnow().isoformat()
-        }
-        pending["orders"].append(entry)
-        save_json(PENDING_FILE, pending)
-
-        # отправим всем админам уведомление с кнопками принять/отклонить
-        for admin in ADMINS:
-            kb = InlineKeyboardBuilder()
-            kb.button(text="✅ Qabul qilish", callback_data=f"admin_accept_{entry['order_id']}")
-            kb.button(text="❌ Rad etish", callback_data=f"admin_reject_{entry['order_id']}")
-            kb.button(text="🗑️ O'chirish", callback_data=f"admin_delete_{entry['order_id']}")
-            kb.adjust(2)
-            await bot.send_message(admin,
-                                   f"📩 Yangi buyurtma (pending):\n\nID: <code>{entry['order_id']}</code>\nUser: @{entry['username']} ({entry['user_id']})\nBuyurtma: {entry['order_title']}\nVaqt: {entry['created_at']}",
-                                   reply_markup=kb.as_markup(), parse_mode="HTML")
-        await message.answer("Buyurtmangiz moderatorlarga yuborildi. Tez orada ko'rib chiqiladi.")
-        temp_state["awaiting_order_from"].pop(user_id, None)
-        return
-
-    # если ждем ввод ID для поиска (админ)
-    if temp_state["awaiting_search_from"].get(user_id):
-        try:
-            search_id = int(message.text.strip())
-        except:
-            await message.answer("Iltimos, haqiqiy numeric user_id kiriting.")
-            return
-        # ищем
-        orders_db = load_json(ORDERS_FILE, {"orders": []})["orders"]
-        user_orders = [o for o in orders_db if o.get("user_id") == search_id]
-        if not user_orders:
-            await message.answer("Bu foydalanuvchiga oid tasdiqlangan zakazlar topilmadi.")
-        else:
-            text = f"Foydalanuvchi {search_id} bo'yicha {len(user_orders)} zakaz:\n\n"
-            for o in user_orders:
-                text += f"ID: {o.get('order_id')}\nTitle: {o.get('order_title')}\nStatus: {o.get('status')}\n\n"
-            await message.answer(text)
-        temp_state["awaiting_search_from"].pop(user_id, None)
-        return
-
-    # если ждем текст для broadcast
-    if temp_state["awaiting_broadcast_from"].get(user_id):
-        text = message.text
-        # получаем всех пользователей с approved заказами
-        orders_db = load_json(ORDERS_FILE, {"orders": []})["orders"]
-        user_ids = set(o.get("user_id") for o in orders_db if o.get("status") == "approved")
-        sent = 0
-        for uid in user_ids:
-            try:
-                await bot.send_message(uid, f"📢 Admin рассылка:\n\n{text}")
-                sent += 1
-            except Exception:
-                pass
-        await message.answer(f"Рассылка отправлена {sent} пользователям (approved orders).")
-        temp_state["awaiting_broadcast_from"].pop(user_id, None)
-        return
-
-    # иначе — простое сообщение (игнорируем)
-    # можно добавить логику обычных сообщений
-    return
-
-# ---------- Открыть админ-панель ----------
-@dp.callback_query(lambda c: c.data == "open_admin")
-async def open_admin_panel(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
-        return await callback.answer("Siz admin emassiz!", show_alert=True)
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📂 Pending zakazlar", callback_data="admin_pending_list")
-    kb.button(text="📚 Tasdiqlangan zakazlar", callback_data="admin_approved_list")
-    kb.button(text="🔎 Qidiruv user_id bo'yicha", callback_data="admin_search_user")
-    kb.button(text="📊 Statistik", callback_data="admin_stats")
-    kb.button(text="✉️ Broadcast (approved users)", callback_data="admin_broadcast")
-    kb.adjust(2)
-    await callback.message.answer("🔐 Admin panel:", reply_markup=kb.as_markup())
-    await callback.answer()
-
-# ---------- Пагинация: вспомогательная сборка клавиатур ----------
-PAGE_SIZE = 3
-
-def paginate_list(items, page):
-    total = len(items)
-    max_page = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-    if page < 1: page = 1
-    if page > max_page: page = max_page
-    start = (page - 1) * PAGE_SIZE
-    end = start + PAGE_SIZE
-    return items[start:end], page, max_page
-
-def nav_kb(prefix, page, max_page):
-    kb = InlineKeyboardBuilder()
-    if page > 1:
-        kb.button(text="⬅ Oldingi", callback_data=f"{prefix}_page_{page-1}")
-    if page < max_page:
-        kb.button(text="Keyingi ➡", callback_data=f"{prefix}_page_{page+1}")
+    for c in CATEGORIES:
+        kb.button(text=c, callback_data=f"cat_{c}")
     kb.adjust(2)
     return kb.as_markup()
 
-# ---------- Admin: список pending (страница) ----------
-@dp.callback_query(lambda c: c.data == "admin_pending_list")
-async def admin_pending_list(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
-        return await callback.answer("Siz admin emassiz!", show_alert=True)
-    pending = load_json(PENDING_FILE, {"orders": []})["orders"]
-    if not pending:
-        return await callback.message.answer("Hozircha pending zakaz yo'q.")
-    page_items, page, max_page = paginate_list(pending, 1)
-    text = f"📂 Pending zakazlar — {len(pending)} ta\n\n"
-    for o in page_items:
-        text += f"ID: <code>{o['order_id']}</code>\nUser: @{o.get('username')} ({o.get('user_id')})\nTitle: {o.get('order_title')}\n\n"
-    kb = nav_kb("admin_pending", page, max_page)
-    # для быстрого просмотра деталей — добавим кнопку посмотреть первый элемент
-    kb2 = InlineKeyboardBuilder()
-    kb2.button(text="Ko'rish (1)", callback_data=f"admin_view_{page_items[0]['order_id']}")
-    kb2.adjust(1)
-    await callback.message.answer(text, reply_markup=kb)
-    await callback.message.answer("Tezkor:", reply_markup=kb2.as_markup())
+def start_kb(user: types.User):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📦 Buyurtma berish", callback_data="make_order")
+    kb.button(text="📄 Mening zakazlarim", callback_data="my_orders")
+    # если пользователь является модератор — показать кнопку "My tasks"
+    if user.id in MODERATORS.values():
+        kb.button(text="🛠️ My tasks", callback_data="my_tasks")
+    kb.adjust(2)
+    return kb.as_markup()
+
+def mod_notification_kb(order_id: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👀 Ko'rish", callback_data=f"mod_view_{order_id}")
+    kb.button(text="🛠️ Olish (в работу)", callback_data=f"mod_start_{order_id}")
+    kb.button(text="📤 Отправить результат", callback_data=f"mod_send_{order_id}")
+    kb.button(text="❌ Rad etish", callback_data=f"mod_reject_{order_id}")
+    kb.button(text="🗑️ O'chirish", callback_data=f"mod_delete_{order_id}")
+    kb.adjust(2)
+    return kb.as_markup()
+
+def order_options_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Baholash ⭐️", callback_data="rate")
+    kb.button(text="Admin bilan bog'lanish 📩", callback_data="contact_admin")
+    kb.button(text="Zakazni bekor qilish ❌", callback_data="cancel_order")
+    kb.adjust(2)
+    return kb.as_markup()
+
+# ------------------ Пользовательский флоу ------------------
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer("Salom! Nima qilmoqchisiz?", reply_markup=start_kb(message.from_user))
+
+@dp.callback_query(lambda c: c.data == "make_order")
+async def cb_make_order(callback: types.CallbackQuery):
+    await callback.message.answer("Qaysi sohada buyurtma berasiz? Tanlang:", reply_markup=categories_kb())
     await callback.answer()
 
-@dp.callback_query(lambda c: c.data.startswith("admin_pending_page_"))
-async def admin_pending_page(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
-        return await callback.answer("Siz admin emassiz!", show_alert=True)
-    parts = callback.data.split("_")
-    page = int(parts[-1])
-    pending = load_json(PENDING_FILE, {"orders": []})["orders"]
-    page_items, page, max_page = paginate_list(pending, page)
-    text = f"📂 Pending zakazlar — {len(pending)} ta\n\n"
-    for o in page_items:
-        text += f"ID: <code>{o['order_id']}</code>\nUser: @{o.get('username')} ({o.get('user_id')})\nTitle: {o.get('order_title')}\n\n"
-    kb = nav_kb("admin_pending", page, max_page)
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+@dp.callback_query(lambda c: c.data.startswith("cat_"))
+async def cb_category_selected(callback: types.CallbackQuery):
+    category = callback.data.split("_", 1)[1]
+    # Сохраняем в temp_state, ждем описание от пользователя
+    temp_state["awaiting_order_from"][callback.from_user.id] = category
+    await callback.message.answer(f"Tanlangan: {category}\nIltimos, buyurtma tavsifini yuboring (tekst).")
     await callback.answer()
 
-# ---------- Admin: список approved ----------
-@dp.callback_query(lambda c: c.data == "admin_approved_list")
-async def admin_approved_list(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
-        return await callback.answer("Siz admin emassiz!", show_alert=True)
-    orders = load_json(ORDERS_FILE, {"orders": []})["orders"]
-    if not orders:
-        return await callback.message.answer("Tasdiqlangan zakazlar topilmadi.")
-    page_items, page, max_page = paginate_list(orders, 1)
-    text = f"📚 Tasdiqlangan zakazlar — {len(orders)} ta\n\n"
-    for o in page_items:
-        text += f"ID: <code>{o['order_id']}</code>\nUser: @{o.get('username')} ({o.get('user_id')})\nTitle: {o.get('order_title')}\nStatus: {o.get('status')}\n\n"
-    kb = nav_kb("admin_approved", page, max_page)
-    await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
-    await callback.answer()
+@dp.message()
+async def catch_message_general(message: types.Message):
+    uid = message.from_user.id
 
-@dp.callback_query(lambda c: c.data.startswith("admin_approved_page_"))
-async def admin_approved_page(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
-        return await callback.answer("Siz admin emassiz!", show_alert=True)
-    page = int(callback.data.split("_")[-1])
-    orders = load_json(ORDERS_FILE, {"orders": []})["orders"]
-    page_items, page, max_page = paginate_list(orders, page)
-    text = f"📚 Tasdiqlangan zakazlar — {len(orders)} ta\n\n"
-    for o in page_items:
-        text += f"ID: <code>{o['order_id']}</code>\nUser: @{o.get('username')} ({o.get('user_id')})\nTitle: {o.get('order_title')}\nStatus: {o.get('status')}\n\n"
-    kb = nav_kb("admin_approved", page, max_page)
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    await callback.answer()
+    # 1) если ждем описание заказа от пользователя
+    if uid in temp_state["awaiting_order_from"]:
+        category = temp_state["awaiting_order_from"].pop(uid)
+        desc = message.text or ""
+        order_id = create_order_row(message.from_user, desc, category)
+        # отправляем уведомление ответственному модеру
+        mod_id = MODERATORS.get(category)
+        if mod_id:
+            try:
+                await bot.send_message(
+                    mod_id,
+                    f"📩 Yangi buyurtma ({category}):\nID: <code>{order_id}</code>\nFrom: @{message.from_user.username or message.from_user.id} ({message.from_user.id})\n\n{desc}",
+                    reply_markup=mod_notification_kb(order_id),
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+        await message.answer("Buyurtmangiz moderatorga yuborildi. Tez orada tekshiriladi.", reply_markup=order_options_kb())
+        return
 
-# ---------- Admin: view single order details ----------
-@dp.callback_query(lambda c: c.data.startswith("admin_view_"))
-async def admin_view_order(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
-        return await callback.answer("Siz admin emassiz!", show_alert=True)
+    # 2) если модератор должен прислать результат (ждем файл/фото/док/текст)
+    if uid in temp_state["awaiting_send_from_mod"]:
+        order_id = temp_state["awaiting_send_from_mod"].pop(uid)
+        order = get_order(order_id)
+        if not order:
+            await message.answer("Order topilmadi yoki allaqachon ishlangan.")
+            return
+        user_id = order["user_id"]
+        # Попробуем переслать (копировать) любое сообщение модератора заказчику
+        try:
+            await bot.copy_message(chat_id=user_id, from_chat_id=uid, message_id=message.message_id)
+        except Exception:
+            # если не получилось копировать, отправим текст
+            if message.text:
+                await bot.send_message(user_id, f"📤 Moderator прислал результат:\n\n{message.text}")
+            else:
+                await message.answer("Не удалось переслать сообщение. Попробуйте отправить как документ/фото или текст ещё раз.")
+                return
+        # обновим статус заказа
+        res_text = message.text if message.text else "[media]"
+        update_order_status(order_id, "done", assigned_mod=uid, result_text=res_text)
+        await message.answer("Natija yuborildi va zakaz belgilandi: DONE ✅")
+        return
+
+    # иначе — проверка команды просмотра своих заказов у пользователя/модератора (если кликали кнопку)
+    # просто игнорируем свободные сообщения
+    return
+
+# ------------------ Модераторские callback'ы ------------------
+@dp.callback_query(lambda c: c.data.startswith("mod_view_"))
+async def mod_view(callback: types.CallbackQuery):
+    mod_id = callback.from_user.id
     order_id = callback.data.split("_", 2)[2]
-    pending = load_json(PENDING_FILE, {"orders": []})["orders"]
-    orders = load_json(ORDERS_FILE, {"orders": []})["orders"]
-    found = None
-    where = None
-    for o in pending:
-        if o["order_id"] == order_id:
-            found = o
-            where = "pending"
-            break
-    if not found:
-        for o in orders:
-            if o["order_id"] == order_id:
-                found = o
-                where = "approved"
-                break
-    if not found:
+    # проверка прав: модератор должен соответствовать категории заказа
+    row = get_order(order_id)
+    if not row:
         await callback.answer("Order topilmadi.", show_alert=True)
         return
-    text = f"📝 Detal: \nID: <code>{found['order_id']}</code>\nUser: @{found.get('username')} ({found.get('user_id')})\nTitle: {found.get('order_title')}\nCategory: {found.get('category')}\nBudget: {found.get('budget')}\nCreated: {found.get('created_at')}\nStatus: {found.get('status','pending')}"
-    # buttons: accept/reject/delete (depend on where)
+    cat = row["category"]
+    expected_mod = MODERATORS.get(cat)
+    if mod_id != expected_mod:
+        await callback.answer("Bu buyurtma sizga tegishli emas.", show_alert=True)
+        return
+    text = (
+        f"📝 Order\nID: <code>{row['order_id']}</code>\nUser: @{row['username']} ({row['user_id']})\n"
+        f"Kategoriya: {row['category']}\nDescription: {row['description']}\nStatus: {row['status']}\nCreated: {row['created_at']}"
+    )
     kb = InlineKeyboardBuilder()
-    if where == "pending":
-        kb.button(text="✅ Qabul", callback_data=f"admin_accept_{found['order_id']}")
-        kb.button(text="❌ Rad etish", callback_data=f"admin_reject_{found['order_id']}")
-    kb.button(text="🗑️ O'chirish", callback_data=f"admin_delete_{found['order_id']}")
+    if row["status"] == "pending":
+        kb.button(text="🛠️ Olish (в работу)", callback_data=f"mod_start_{order_id}")
+    if row["status"] in ("pending", "in_progress"):
+        kb.button(text="📤 Отправить результат", callback_data=f"mod_send_{order_id}")
+        kb.button(text="❌ Rad etish", callback_data=f"mod_reject_{order_id}")
+    kb.button(text="🗑️ O'chirish", callback_data=f"mod_delete_{order_id}")
     kb.adjust(2)
     await callback.message.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
     await callback.answer()
 
-# ---------- Admin: принять заказ ----------
-@dp.callback_query(lambda c: c.data.startswith("admin_accept_"))
-async def admin_accept(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
-        return await callback.answer("Siz admin emassiz!", show_alert=True)
+@dp.callback_query(lambda c: c.data.startswith("mod_start_"))
+async def mod_start(callback: types.CallbackQuery):
+    mod_id = callback.from_user.id
     order_id = callback.data.split("_", 2)[2]
-    pending = load_json(PENDING_FILE, {"orders": []})["orders"]
-    orders_db = load_json(ORDERS_FILE, {"orders": []})["orders"]
-    # найти и переместить
-    found = None
-    for o in pending:
-        if o["order_id"] == order_id:
-            found = o
-            break
-    if not found:
-        return await callback.answer("Order topilmadi (yoki allaqachon ishlangan).", show_alert=True)
-    # пометим approved
-    found["status"] = "approved"
-    found["approved_at"] = datetime.utcnow().isoformat()
-    orders_db.append(found)
-    # удалим из pending
-    pending = [o for o in pending if o["order_id"] != order_id]
-    save_json(PENDING_FILE, {"orders": pending})
-    save_json(ORDERS_FILE, {"orders": orders_db})
-    # уведомить пользователя
+    row = get_order(order_id)
+    if not row:
+        await callback.answer("Order topilmadi.", show_alert=True)
+        return
+    # проверка прав
+    if MODERATORS.get(row["category"]) != mod_id:
+        await callback.answer("Bu buyurtma sizga tegishli emas.", show_alert=True)
+        return
+    update_order_status(order_id, "in_progress", assigned_mod=mod_id)
+    await callback.message.answer(f"Zakaz {order_id} olindi в работу ✅. Endi 'Отправить результат' tugmasini bosing va fayl/tekst yuboring.")
+    await callback.answer("Olingan в работу.")
+
+@dp.callback_query(lambda c: c.data.startswith("mod_send_"))
+async def mod_send(callback: types.CallbackQuery):
+    mod_id = callback.from_user.id
+    order_id = callback.data.split("_", 2)[2]
+    row = get_order(order_id)
+    if not row:
+        await callback.answer("Order topilmadi.", show_alert=True)
+        return
+    if MODERATORS.get(row["category"]) != mod_id:
+        await callback.answer("Bu buyurtma sizga tegishli emas.", show_alert=True)
+        return
+    # ставим ожидание: следующий message от модератора будет переслан заказчику
+    temp_state["awaiting_send_from_mod"][mod_id] = order_id
+    await callback.message.answer("Iltimos, natijani (fayl/rasm/dokument/video yoki tekst) yuboring — u avtomatik tarzda mijozga yuboriladi.")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("mod_reject_"))
+async def mod_reject(callback: types.CallbackQuery):
+    mod_id = callback.from_user.id
+    order_id = callback.data.split("_", 2)[2]
+    row = get_order(order_id)
+    if not row:
+        await callback.answer("Order topilmadi.", show_alert=True)
+        return
+    if MODERATORS.get(row["category"]) != mod_id:
+        await callback.answer("Bu buyurtma sizga tegishli emas.", show_alert=True)
+        return
+    update_order_status(order_id, "rejected", assigned_mod=mod_id, result_text="rejected_by_mod")
+    # уведомляем заказчика
     try:
-        await bot.send_message(found["user_id"], f"✅ Sizning buyurtmangiz (ID: {found['order_id']}) qabul qilindi.")
+        await bot.send_message(row["user_id"], f"❌ Sizning buyurtmangiz (ID: {order_id}) moderator tomonidan rad etildi.")
     except Exception:
         pass
-    await callback.message.edit_text("✅ Zakaz qabul qilindi va saqlandi.")
-    await callback.answer("Qabul qilindi.")
+    await callback.message.answer("Zakaz rad etildi va mijozga xabar yuborildi.")
+    await callback.answer()
 
-# ---------- Admin: отклонить заказ ----------
-@dp.callback_query(lambda c: c.data.startswith("admin_reject_"))
-async def admin_reject(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
-        return await callback.answer("Siz admin emassiz!", show_alert=True)
+@dp.callback_query(lambda c: c.data.startswith("mod_delete_"))
+async def mod_delete(callback: types.CallbackQuery):
+    mod_id = callback.from_user.id
     order_id = callback.data.split("_", 2)[2]
-    pending = load_json(PENDING_FILE, {"orders": []})["orders"]
-    found = None
-    for o in pending:
-        if o["order_id"] == order_id:
-            found = o
-            break
-    if not found:
-        return await callback.answer("Order topilmadi.", show_alert=True)
-    # удалить и уведомить
-    pending = [o for o in pending if o["order_id"] != order_id]
-    save_json(PENDING_FILE, {"orders": pending})
-    try:
-        await bot.send_message(found["user_id"], f"❌ Sizning buyurtmangiz (ID: {found['order_id']}) moderator tomonidan rad etildi.")
-    except Exception:
-        pass
-    await callback.message.edit_text("❌ Zakaz rad etildi.")
-    await callback.answer("Rad etildi.")
-
-# ---------- Admin: удалить заказ (из approved или pending) ----------
-@dp.callback_query(lambda c: c.data.startswith("admin_delete_"))
-async def admin_delete(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
-        return await callback.answer("Siz admin emassiz!", show_alert=True)
-    order_id = callback.data.split("_", 2)[2]
-    pending = load_json(PENDING_FILE, {"orders": []})["orders"]
-    orders_db = load_json(ORDERS_FILE, {"orders": []})["orders"]
-    new_pending = [o for o in pending if o["order_id"] != order_id]
-    new_orders = [o for o in orders_db if o["order_id"] != order_id]
-    save_json(PENDING_FILE, {"orders": new_pending})
-    save_json(ORDERS_FILE, {"orders": new_orders})
-    await callback.message.edit_text("🗑️ Zakaz o'chirildi.")
-    await callback.answer("O'chirildi.")
-
-# ---------- Admin: статистика ----------
-@dp.callback_query(lambda c: c.data == "admin_stats")
-async def admin_stats(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
-        return await callback.answer("Siz admin emassiz!", show_alert=True)
-    s = get_stats()
-    text = (
-        f"📊 Statistika:\n\n"
-        f"Umumiy zakazlar (pending+approved): {s['total']}\n"
-        f"✅ Tasdiqlangan: {s['approved']}\n"
-        f"❌ Rad etilgan: {s['rejected']}\n"
-        f"⏳ Pending: {s['pending']}\n"
-    )
-    await callback.message.answer(text)
+    row = get_order(order_id)
+    if not row:
+        await callback.answer("Order topilmadi.", show_alert=True)
+        return
+    # Только модератор категории или админ (в нашем случае модераторы только свои) может удалить
+    if MODERATORS.get(row["category"]) != mod_id:
+        await callback.answer("Bu buyurtma sizga tegishli emas.", show_alert=True)
+        return
+    delete_order(order_id)
+    await callback.message.answer("Zakaz o'chirildi.")
     await callback.answer()
 
-# ---------- Admin: поиск по user_id ----------
-@dp.callback_query(lambda c: c.data == "admin_search_user")
-async def admin_search_user(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
-        return await callback.answer("Siz admin emassiz!", show_alert=True)
-    temp_state["awaiting_search_from"][callback.from_user.id] = True
-    await callback.message.answer("Qidiriladigan user_id ni kiriting (raqam):")
+# ------------------ Просмотр задач модератора ------------------
+@dp.callback_query(lambda c: c.data == "my_tasks")
+async def cb_my_tasks(callback: types.CallbackQuery):
+    mod_id = callback.from_user.id
+    if mod_id not in MODERATORS.values():
+        await callback.answer("Siz moderatorsiz emas.", show_alert=True)
+        return
+    # найдём категорию(и) за которую отвечает этот модератор (в нашем случае 1)
+    cats = [k for k, v in MODERATORS.items() if v == mod_id]
+    text = ""
+    any_found = False
+    for cat in cats:
+        pending = get_pending_orders_by_category(cat)
+        if pending:
+            any_found = True
+            text += f"📂 {cat} — {len(pending)} pending:\n\n"
+            for o in pending:
+                text += f"ID: <code>{o['order_id']}</code>\nUser: @{o['username']} ({o['user_id']})\n{ o['description'] }\n\n"
+    if not any_found:
+        await callback.message.answer("Hozircha sizga tegishli pending yo'q.")
+    else:
+        await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
 
-# ---------- Admin: broadcast (следующее сообщение станет рассылкой) ----------
-@dp.callback_query(lambda c: c.data == "admin_broadcast")
-async def admin_broadcast(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
-        return await callback.answer("Siz admin emassiz!", show_alert=True)
-    temp_state["awaiting_broadcast_from"][callback.from_user.id] = True
-    await callback.message.answer("Yubormoqchi bo'lgan xabar matnini kiriting — u barcha approved foydalanuvchilarga jo'natiladi.")
+# ------------------ Пользователь: мои заказы ------------------
+@dp.callback_query(lambda c: c.data == "my_orders")
+async def cb_my_orders(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    rows = get_user_orders(user_id)
+    if not rows:
+        await callback.message.answer("Sizda hech qanday zakaz yo'q.")
+        await callback.answer()
+        return
+    text = "Sizning zakazlaringiz:\n\n"
+    for r in rows:
+        text += f"ID: <code>{r['order_id']}</code>\nKategoriya: {r['category']}\nStatus: {r['status']}\nResult: {r['result_text'] or '—'}\n\n"
+    await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
 
-# ---------- Запуск ----------
+# ------------------ Запуск ------------------
 async def main():
-    print("Bot started...")
+    print("Bot running...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
